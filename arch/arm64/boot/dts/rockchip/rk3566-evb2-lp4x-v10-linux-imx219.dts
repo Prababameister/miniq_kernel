@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2024 Rockchip Electronics Co., Ltd.
+ *
+ * Geniatech XPI-3566-ZERO (a.k.a. XPZ3566) + Sony IMX219 (Raspberry Pi cam v2)
+ *
+ * Base board file: rk3566-evb2-lp4x-v10-linux.dts. Geniatech's own factory
+ * firmware is built from exactly this board file (model string in the shipped
+ * DTB is still "Rockchip RK3566 EVB2 LP4X V10 Board", compatible
+ * "rockchip,rk3566-evb2-lp4x-v10"), so the EVB2 tree *is* this board's tree.
+ *
+ * Every hardware value below was cross-checked against the device tree
+ * extracted from the official factory image
+ *   rk3566-xpz-pi_RKS221221-base_hwV1.0_20240125205039  (rockdev/update.img).
+ *
+ * ---------------------------------------------------------------------------
+ * 1. CAMERA - IMX219 replacing the OV5647 on the 15-pin FPC connector
+ *
+ *    Confirmed against the factory DTB:
+ *      - I2C bus         : i2c2  (i2c@fe5b0000)
+ *      - MIPI            : csi2_dphy1, 2 data lanes  -> rkisp_vir0
+ *      - sensor enable   : gpio4 RK_PB1  (factory OV5647 uses it as
+ *                          "pwdn-gpios" ACTIVE_LOW; the pin is an active-high
+ *                          sensor-enable, so as an imx219 "reset-gpios" it is
+ *                          ACTIVE_HIGH - driver drives it high to run)
+ *      - MCLK / XVCLK    : none on the connector. The Raspberry Pi 15-pin
+ *                          FPC has no clock pin; every RPi-style module
+ *                          carries its own oscillator. The factory
+ *                          "CLK_CAMERA_25MHZ" fixed-clock (no pinctrl) is
+ *                          the OV5647 module's 25 MHz crystal, not an
+ *                          on-board source. IMX219 modules (RPi v2 and
+ *                          clones) use 24 MHz, so imx219 gets its own
+ *                          24 MHz fixed-clock below and runs at the rates
+ *                          its register tables assume. If a module has a
+ *                          different crystal, change clock-frequency here.
+ *
+ * 2. WIFI - AP6256 SDIO, on sdmmc1 (dwmmc@fe2c0000)
+ *
+ *    The AP6256 power/reset wiring in the EVB2 tree (gpio2 RK_PB1 / RK_PB2)
+ *    is CORRECT - it is byte-identical to the factory DTB. (An earlier guess
+ *    that moved it to gpio0 was wrong and has been removed.)
+ *
+ *    The 2024-05 SDK regressed two SDIO settings vs the factory 2024-01 tree:
+ *      a) added  sd-uhs-sdr104  + rockchip,use-v2-tuning  to &sdmmc1
+ *      b) bumped the sdmmc1 clk/cmd/data pin drive strength
+ *         from  pcfg_pull_up_drv_level_2  to  ..._level_8
+ *    SDR104 forces a 1.8 V UHS voltage switch this board does not do for the
+ *    WiFi module, and the overdriven pins ring; either way CMD5 gets no
+ *    answer and bcmdhd bails with "failed to power up DHD generic adapter,
+ *    err=-19". Both are reverted below to match the known-good factory config.
+ * ---------------------------------------------------------------------------
+ */
+
+#include "rk3566-evb2-lp4x-v10-linux.dts"
+
+/* factory OV5647 on this FPC connector - remove it, add imx219 instead */
+/delete-node/ &camera0;
+
+/ {
+	model = "Geniatech XPI-3566-ZERO + IMX219";
+	compatible = "rockchip,rk3566-evb2-lp4x-v10", "rockchip,rk3566";
+
+	/* oscillator on the IMX219 camera module itself */
+	imx219_osc: imx219-osc {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "imx219_xvclk";
+	};
+};
+
+/* ---- WiFi / SDIO: undo the 2024-05 SDK changes, back to factory behaviour ---- */
+&sdmmc1 {
+	/delete-property/ sd-uhs-sdr104;
+	/delete-property/ rockchip,use-v2-tuning;
+};
+
+&sdmmc1_bus4 {
+	rockchip,pins =
+		<2 RK_PA3 1 &pcfg_pull_up_drv_level_2>,
+		<2 RK_PA4 1 &pcfg_pull_up_drv_level_2>,
+		<2 RK_PA5 1 &pcfg_pull_up_drv_level_2>,
+		<2 RK_PA6 1 &pcfg_pull_up_drv_level_2>;
+};
+
+&sdmmc1_clk {
+	rockchip,pins = <2 RK_PB0 1 &pcfg_pull_up_drv_level_2>;
+};
+
+&sdmmc1_cmd {
+	rockchip,pins = <2 RK_PA7 1 &pcfg_pull_up_drv_level_2>;
+};
+
+/* ---- Camera: IMX219 on i2c2 ---- */
+&i2c2 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c2m1_xfer>;
+
+	imx219: imx219@10 {
+		status = "okay";
+		compatible = "sony,imx219";
+		reg = <0x10>;
+
+		/* module's own 24 MHz oscillator - see header */
+		clocks = <&imx219_osc>;
+		clock-names = "xvclk";
+
+		/* active-high sensor enable (factory OV5647 "pwdn" pin) */
+		reset-gpios = <&gpio4 RK_PB1 GPIO_ACTIVE_HIGH>;
+
+		/* single always-on 3V3; RPi module has its own on-board LDOs */
+		avdd-supply  = <&vcc_camera>;
+		dovdd-supply = <&vcc_camera>;
+		dvdd-supply  = <&vcc_camera>;
+
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		/*
+		 * Must match /etc/iqfiles/imx219_<name>_<lens-name>.json
+		 * exactly (case-sensitive filesystem) - rkaiq builds that
+		 * filename straight from these two DT strings. Only
+		 * imx219_rpi-camera-v2_default.json exists on this rootfs.
+		 */
+		rockchip,camera-module-name = "rpi-camera-v2";
+		rockchip,camera-module-lens-name = "default";
+
+		port {
+			imx219_out: endpoint {
+				remote-endpoint = <&dphy1_in>;
+				data-lanes = <1 2>;
+				link-frequencies = /bits/ 64 <456000000>;
+			};
+		};
+	};
+};
+
+/* re-point the D-PHY1 sensor-side endpoint from ov5647 to imx219 */
+&dphy1_in {
+	remote-endpoint = <&imx219_out>;
+	data-lanes = <1 2>;
+};
+
+/*
+ * csi2_dphy1, mipi_csi2, rkisp, rkisp_vir0, rkcif_mmu are already configured
+ * for this exact topology by rk3566-evb2-lp4x-v10.dtsi - nothing else to do.
+ */
